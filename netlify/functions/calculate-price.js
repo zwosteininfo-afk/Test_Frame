@@ -1,5 +1,5 @@
 const crypto = require('crypto');
-const https = https = require('https');
+const https = require('https');
 
 function percentEncode(str) {
   return encodeURIComponent(str)
@@ -68,8 +68,8 @@ function fetchBrickLink(fullUrl, credentials) {
       res.on('data', chunk => { data += chunk; });
       res.on('end', () => {
         try {
-          // Prüfen, ob BrickLink eine Wartungsseite (HTML) statt JSON liefert
-          if (data.includes('<!DOCTYPE html>')) {
+          // Prüfen, ob BrickLink eine HTML-Wartungsseite liefert
+          if (data.includes('<!DOCTYPE html>') || data.includes('<html')) {
             resolve({ statusCode: 503, raw: data });
             return;
           }
@@ -114,18 +114,28 @@ exports.handler = async (event) => {
   let legoSetName = `LEGO® Set ${setNumber}`;
 
   try {
-    // 0. Artikeldetails abrufen (für den echten Namen)
+    // Schritt 0: Prüfen, ob das Set überhaupt auf BrickLink existiert + echten Namen holen
     let itemUrl = `https://api.bricklink.com/api/store/v1/items/SET/${itemNo}`;
     let itemRes = await fetchBrickLink(itemUrl, credentials).catch(err => null);
-    
+
+    // Echte Wartungsprüfung (nur wenn BrickLink down ist / HTML wirft)
     if (itemRes && itemRes.statusCode === 503) {
       return getMaintenanceResponse();
     }
-    if (itemRes && itemRes.statusCode === 200 && itemRes.data && itemRes.data.data && itemRes.data.data.name) {
-      legoSetName = itemRes.data.data.name;
+
+    // Wenn das Set nicht existiert (BrickLink meldet 404 oder Meta-Code ist nicht 200)
+    if (!itemRes || itemRes.statusCode !== 200 || !itemRes.data || itemRes.data.meta?.code !== 200) {
+      return {
+        statusCode: 404,
+        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+        body: JSON.stringify({ error: `Das LEGO® Set "${setNumber}" existiert nicht oder wurde auf BrickLink nicht gefunden.` })
+      };
     }
 
-    // 1. Kaskade Schritt 1: Deutschland (Sold / DE)
+    // Echten Namen übernehmen
+    legoSetName = itemRes.data.data.name;
+
+    // Schritt 1: Kaskade Deutschland (Sold / DE)
     let urlUsedDE = `https://api.bricklink.com/api/store/v1/items/SET/${itemNo}/price?new_or_used=U&guide_type=sold&currency_code=EUR&country_code=DE`;
     let urlNewDE = `https://api.bricklink.com/api/store/v1/items/SET/${itemNo}/price?new_or_used=N&guide_type=sold&currency_code=EUR&country_code=DE`;
 
@@ -134,7 +144,7 @@ exports.handler = async (event) => {
       fetchBrickLink(urlNewDE, credentials).catch(err => null)
     ]);
 
-    if (usedDeRes && usedDeRes.statusCode === 503 || newDeRes && newDeRes.statusCode === 503) {
+    if ((usedDeRes && usedDeRes.statusCode === 503) || (newDeRes && newDeRes.statusCode === 503)) {
       return getMaintenanceResponse();
     }
 
@@ -145,7 +155,7 @@ exports.handler = async (event) => {
       bricklinkNewAvg = parseFloat(newDeRes.data.data.qty_avg_price || newDeRes.data.data.avg_price) || 0;
     }
 
-    // 2. Kaskade Schritt 2: Europa / Global (Sold / Global) - falls DE leer ist
+    // Schritt 2: Kaskade Global (Sold / Global) - falls DE leer ist
     if (bricklinkUsedAvg === 0 || bricklinkNewAvg === 0) {
       let urlUsedGlobal = `https://api.bricklink.com/api/store/v1/items/SET/${itemNo}/price?new_or_used=U&guide_type=sold&currency_code=EUR`;
       let urlNewGlobal = `https://api.bricklink.com/api/store/v1/items/SET/${itemNo}/price?new_or_used=N&guide_type=sold&currency_code=EUR`;
@@ -163,7 +173,7 @@ exports.handler = async (event) => {
       }
     }
 
-    // 3. Kaskade Schritt 3: Aktuelle Angebote (Stock) als letzter Ausweg vor Abbruch
+    // Schritt 3: Kaskade Stock (Aktuelle Angebote)
     if (bricklinkUsedAvg === 0 || bricklinkNewAvg === 0) {
       let urlUsedStock = `https://api.bricklink.com/api/store/v1/items/SET/${itemNo}/price?new_or_used=U&guide_type=stock&currency_code=EUR`;
       let urlNewStock = `https://api.bricklink.com/api/store/v1/items/SET/${itemNo}/price?new_or_used=N&guide_type=stock&currency_code=EUR`;
@@ -181,16 +191,15 @@ exports.handler = async (event) => {
       }
     }
 
-    // Wenn absolut gar keine Marktdaten auffindbar sind
+    // Wenn das Set existiert, aber absolut nirgendwo Preisdaten vorliegen
     if (bricklinkUsedAvg === 0 && bricklinkNewAvg === 0) {
       return {
         statusCode: 404,
         headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
         body: JSON.stringify({ error: `Für das Set "${setNumber}" liegen aktuell keine Marktdaten vor.` })
-      }; geglueckt
+      };
     }
 
-    // Automatische Berechnung des jeweils fehlenden Wertes
     if (bricklinkNewAvg === 0) bricklinkNewAvg = bricklinkUsedAvg * 1.35;
     if (bricklinkUsedAvg === 0) bricklinkUsedAvg = bricklinkNewAvg / 1.35;
 
@@ -198,7 +207,7 @@ exports.handler = async (event) => {
     return getMaintenanceResponse();
   }
 
-  // Reguläre Preiskalkulation (wie in deiner aktuellen Version)
+  // Reguläre Preiskalkulation
   let tierMultiplier = 1.0;
   let detectedTier = "Standard";
 
