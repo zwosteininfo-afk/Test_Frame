@@ -6,8 +6,7 @@ function percentEncode(str) {
     .replace(/!/g, '%21')
     .replace(/\*/g, '%2A')
     .replace(/'/g, '%27')
-    .replace(/\(/g, '%28')
-    .replace(/\)/g, '%29');
+    .replace(/\(/g, '\%28') .replace(/\)/g, '%29');
 }
 
 function generateOAuthHeader(baseUrl, method, params, credentials) {
@@ -68,7 +67,6 @@ function fetchBrickLink(fullUrl, credentials) {
       res.on('data', chunk => { data += chunk; });
       res.on('end', () => {
         try {
-          // Prüfen, ob BrickLink eine HTML-Wartungsseite liefert
           if (data.includes('<!DOCTYPE html>') || data.includes('<html')) {
             resolve({ statusCode: 503, raw: data });
             return;
@@ -114,17 +112,20 @@ exports.handler = async (event) => {
   let legoSetName = `LEGO® Set ${setNumber}`;
 
   try {
-    // Schritt 0: Prüfen, ob das Set überhaupt auf BrickLink existiert + echten Namen holen
+    // Schritt 0: Artikeldetails abrufen (Echter Name + Existenzprüfung)
     let itemUrl = `https://api.bricklink.com/api/store/v1/items/SET/${itemNo}`;
     let itemRes = await fetchBrickLink(itemUrl, credentials).catch(err => null);
-
-    // Echte Wartungsprüfung (nur wenn BrickLink down ist / HTML wirft)
+    
+    // Nur bei echter Wartung (503) abbrechen
     if (itemRes && itemRes.statusCode === 503) {
       return getMaintenanceResponse();
     }
 
-    // Wenn das Set nicht existiert (BrickLink meldet 404 oder Meta-Code ist nicht 200)
-    if (!itemRes || itemRes.statusCode !== 200 || !itemRes.data || itemRes.data.meta?.code !== 200) {
+    // Wenn der Status 200 ist und Daten da sind, Name übernehmen
+    if (itemRes && itemRes.statusCode === 200 && itemRes.data && itemRes.data.data) {
+      legoSetName = itemRes.data.data.name;
+    } else {
+      // Wenn BrickLink ein echtes 404 (Set existiert nicht) wirft
       return {
         statusCode: 404,
         headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
@@ -132,10 +133,7 @@ exports.handler = async (event) => {
       };
     }
 
-    // Echten Namen übernehmen
-    legoSetName = itemRes.data.data.name;
-
-    // Schritt 1: Kaskade Deutschland (Sold / DE)
+    // 1. Kaskade Schritt 1: Deutschland (Sold / DE)
     let urlUsedDE = `https://api.bricklink.com/api/store/v1/items/SET/${itemNo}/price?new_or_used=U&guide_type=sold&currency_code=EUR&country_code=DE`;
     let urlNewDE = `https://api.bricklink.com/api/store/v1/items/SET/${itemNo}/price?new_or_used=N&guide_type=sold&currency_code=EUR&country_code=DE`;
 
@@ -152,103 +150,4 @@ exports.handler = async (event) => {
       bricklinkUsedAvg = parseFloat(usedDeRes.data.data.qty_avg_price || usedDeRes.data.data.avg_price) || 0;
     }
     if (newDeRes && newDeRes.statusCode === 200 && newDeRes.data && newDeRes.data.data) {
-      bricklinkNewAvg = parseFloat(newDeRes.data.data.qty_avg_price || newDeRes.data.data.avg_price) || 0;
-    }
-
-    // Schritt 2: Kaskade Global (Sold / Global) - falls DE leer ist
-    if (bricklinkUsedAvg === 0 || bricklinkNewAvg === 0) {
-      let urlUsedGlobal = `https://api.bricklink.com/api/store/v1/items/SET/${itemNo}/price?new_or_used=U&guide_type=sold&currency_code=EUR`;
-      let urlNewGlobal = `https://api.bricklink.com/api/store/v1/items/SET/${itemNo}/price?new_or_used=N&guide_type=sold&currency_code=EUR`;
-
-      let [usedGlobRes, newGlobRes] = await Promise.all([
-        fetchBrickLink(urlUsedGlobal, credentials).catch(err => null),
-        fetchBrickLink(urlNewGlobal, credentials).catch(err => null)
-      ]);
-
-      if (bricklinkUsedAvg === 0 && usedGlobRes && usedGlobRes.statusCode === 200 && usedGlobRes.data && usedGlobRes.data.data) {
-        bricklinkUsedAvg = parseFloat(usedGlobRes.data.data.qty_avg_price || usedGlobRes.data.data.avg_price) || 0;
-      }
-      if (bricklinkNewAvg === 0 && newGlobRes && newGlobRes.statusCode === 200 && newGlobRes.data && newGlobRes.data.data) {
-        bricklinkNewAvg = parseFloat(newGlobRes.data.data.qty_avg_price || newGlobRes.data.data.avg_price) || 0;
-      }
-    }
-
-    // Schritt 3: Kaskade Stock (Aktuelle Angebote)
-    if (bricklinkUsedAvg === 0 || bricklinkNewAvg === 0) {
-      let urlUsedStock = `https://api.bricklink.com/api/store/v1/items/SET/${itemNo}/price?new_or_used=U&guide_type=stock&currency_code=EUR`;
-      let urlNewStock = `https://api.bricklink.com/api/store/v1/items/SET/${itemNo}/price?new_or_used=N&guide_type=stock&currency_code=EUR`;
-
-      let [usedStockRes, newStockRes] = await Promise.all([
-        fetchBrickLink(urlUsedStock, credentials).catch(err => null),
-        fetchBrickLink(urlNewStock, credentials).catch(err => null)
-      ]);
-
-      if (bricklinkUsedAvg === 0 && usedStockRes && usedStockRes.statusCode === 200 && usedStockRes.data && usedStockRes.data.data) {
-        bricklinkUsedAvg = parseFloat(usedStockRes.data.data.qty_avg_price || usedStockRes.data.data.avg_price) || 0;
-      }
-      if (bricklinkNewAvg === 0 && newStockRes && newStockRes.statusCode === 200 && newStockRes.data && newStockRes.data.data) {
-        bricklinkNewAvg = parseFloat(newStockRes.data.data.qty_avg_price || newStockRes.data.data.avg_price) || 0;
-      }
-    }
-
-    // Wenn das Set existiert, aber absolut nirgendwo Preisdaten vorliegen
-    if (bricklinkUsedAvg === 0 && bricklinkNewAvg === 0) {
-      return {
-        statusCode: 404,
-        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
-        body: JSON.stringify({ error: `Für das Set "${setNumber}" liegen aktuell keine Marktdaten vor.` })
-      };
-    }
-
-    if (bricklinkNewAvg === 0) bricklinkNewAvg = bricklinkUsedAvg * 1.35;
-    if (bricklinkUsedAvg === 0) bricklinkUsedAvg = bricklinkNewAvg / 1.35;
-
-  } catch (error) {
-    return getMaintenanceResponse();
-  }
-
-  // Reguläre Preiskalkulation
-  let tierMultiplier = 1.0;
-  let detectedTier = "Standard";
-
-  if (bricklinkUsedAvg < 50) {
-    tierMultiplier = 0.75;
-    detectedTier = "Klein (< 50 €)";
-  } else if (bricklinkUsedAvg > 200 || legoSetName.includes("UCS") || legoSetName.includes("Ultimate Collector")) {
-    tierMultiplier = 1.25;
-    detectedTier = "High-End / UCS (> 200 €)";
-  }
-
-  const calculatedPrices = { new: {}, used: {} };
-  const BASE_FACTORS_NEW = { sealed_light_wear: 0.500, sealed_heavy_wear: 0.470, sealed_damaged: 0.430, opened_bags_light_wear: 0.470, opened_bags_heavy_wear: 0.440, opened_bags_damaged: 0.400 };
-  const BASE_FACTORS_USED = { no_instructions_no_box_light: 0.325, no_instructions_no_box_medium: 0.306, no_instructions_no_box_heavy: 0.278, with_instructions_no_box_light: 0.334, with_instructions_no_box_medium: 0.317, with_instructions_no_box_heavy: 0.286, no_instructions_with_box_light: 0.332, no_instructions_with_box_medium: 0.312, no_instructions_with_box_heavy: 0.284, with_instructions_and_box_light: 0.343, with_instructions_and_box_medium: 0.323, with_instructions_and_box_heavy: 0.293 };
-
-  for (const [key, factor] of Object.entries(BASE_FACTORS_NEW)) {
-    calculatedPrices.new[key] = Math.round(bricklinkNewAvg * Math.min(factor * tierMultiplier, 0.60));
-  }
-  for (const [key, factor] of Object.entries(BASE_FACTORS_USED)) {
-    calculatedPrices.used[key] = Math.round(bricklinkUsedAvg * Math.min(factor * tierMultiplier, 0.50));
-  }
-
-  return {
-    statusCode: 200,
-    headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
-    body: JSON.stringify({
-      set: setNumber,
-      name: legoSetName,
-      tier: detectedTier, 
-      marketPrices: { new: bricklinkNewAvg, used: bricklinkUsedAvg },
-      prices: calculatedPrices
-    })
-  };
-};
-
-function getMaintenanceResponse() {
-  return {
-    statusCode: 503,
-    headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
-    body: JSON.stringify({ 
-      error: "🔧 <strong>BrickLink führt gerade Wartungsarbeiten durch</strong>.<br><br>Unser Live-Rechner ist in Kürze wieder da! Du kannst uns deine Liste in der Zwischenzeit gerne direkt per <a href='https://wa.me/491791549957' target='_blank'>WhatsApp (0179 1549957)</a> schicken." 
-    })
-  };
-}
+      bricklinkNewAvg = parseFloat(newDe
